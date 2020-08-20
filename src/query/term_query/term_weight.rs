@@ -4,11 +4,11 @@ use crate::docset::DocSet;
 use crate::postings::SegmentPostings;
 use crate::query::bm25::BM25Weight;
 use crate::query::explanation::does_not_match;
-use crate::query::weight::{for_each_pruning_scorer, for_each_scorer};
+use crate::query::weight::for_each_scorer;
 use crate::query::Weight;
 use crate::query::{Explanation, Scorer};
 use crate::schema::IndexRecordOption;
-use crate::Result;
+use crate::{Result, TERMINATED};
 use crate::Term;
 use crate::{DocId, Score};
 
@@ -69,12 +69,39 @@ impl Weight for TermWeight {
     /// important optimization (e.g. BlockWAND for union).
     fn for_each_pruning(
         &self,
-        threshold: Score,
+        mut threshold: Score,
         reader: &SegmentReader,
         callback: &mut dyn FnMut(DocId, Score) -> Score,
     ) -> crate::Result<()> {
-        let mut scorer = self.scorer(reader, 1.0)?;
-        for_each_pruning_scorer(&mut scorer, threshold, callback);
+        let mut scorer = self.specialized_scorer(reader, 1.0)?;
+        let mut doc = scorer.doc();
+        loop {
+            // We position the scorer on a block that can reach
+            // the threshold.
+            while scorer.block_max_score() < threshold {
+                doc = scorer.last_doc_in_block() + 1;
+                scorer.shallow_seek(doc);
+            }
+            // Seek will effectively load that block.
+            doc = scorer.seek(doc);
+            if doc == TERMINATED {
+                break;
+            }
+            loop {
+                let score = scorer.score();
+                if score > threshold {
+                    threshold = callback(doc, score);
+                }
+                if doc >= scorer.last_doc_in_block() {
+                    break;
+                }
+                doc = scorer.advance();
+                if doc == TERMINATED {
+                   return Ok(());
+                }
+            }
+            scorer.shallow_seek(doc + 1);
+        }
         Ok(())
     }
 }
