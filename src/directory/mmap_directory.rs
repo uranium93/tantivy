@@ -485,10 +485,13 @@ mod tests {
     // The following tests are specific to the MmapDirectory
 
     use super::*;
-    use crate::schema::{Schema, SchemaBuilder, TEXT};
     use crate::Index;
     use crate::ReloadPolicy;
     use crate::{common::HasLen, indexer::LogMergePolicy};
+    use crate::{
+        schema::{Schema, SchemaBuilder, TEXT},
+        IndexSettings,
+    };
 
     #[test]
     fn test_open_non_existent_path() {
@@ -585,11 +588,12 @@ mod tests {
         let schema = schema_builder.build();
 
         {
-            let index = Index::create(mmap_directory.clone(), schema, None).unwrap();
+            let index =
+                Index::create(mmap_directory.clone(), schema, IndexSettings::default()).unwrap();
 
             let mut index_writer = index.writer_for_tests().unwrap();
             let mut log_merge_policy = LogMergePolicy::default();
-            log_merge_policy.set_min_merge_size(3);
+            log_merge_policy.set_min_num_segments(3);
             index_writer.set_merge_policy(Box::new(log_merge_policy));
             for _num_commits in 0..10 {
                 for _ in 0..10 {
@@ -614,9 +618,10 @@ mod tests {
             reader.reload().unwrap();
             let num_segments = reader.searcher().segment_readers().len();
             assert!(num_segments <= 4);
-            let num_components_except_deletes = crate::core::SegmentComponent::iterator().len() - 1;
+            let num_components_except_deletes_and_tempstore =
+                crate::core::SegmentComponent::iterator().len() - 2;
             assert_eq!(
-                num_segments * num_components_except_deletes,
+                num_segments * num_components_except_deletes_and_tempstore,
                 mmap_directory.get_cache_info().mmapped.len()
             );
         }

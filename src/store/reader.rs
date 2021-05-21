@@ -1,12 +1,15 @@
 use super::decompress;
 use super::index::SkipIndex;
-use crate::common::VInt;
-use crate::common::{BinarySerializable, HasLen};
 use crate::directory::{FileSlice, OwnedBytes};
 use crate::schema::Document;
 use crate::space_usage::StoreSpaceUsage;
 use crate::store::index::Checkpoint;
 use crate::DocId;
+use crate::{common::VInt, fastfield::DeleteBitSet};
+use crate::{
+    common::{BinarySerializable, HasLen},
+    error::DataCorruption,
+};
 use lru::LruCache;
 use std::io;
 use std::mem::size_of;
@@ -15,7 +18,7 @@ use std::sync::{Arc, Mutex};
 
 const LRU_CACHE_CAPACITY: usize = 100;
 
-type Block = Arc<Vec<u8>>;
+type Block = OwnedBytes;
 
 type BlockCache = Arc<Mutex<LruCache<usize, Block>>>;
 
@@ -74,7 +77,7 @@ impl StoreReader {
         let mut decompressed_block = vec![];
         decompress(compressed_block.as_slice(), &mut decompressed_block)?;
 
-        let block = Arc::new(decompressed_block);
+        let block = OwnedBytes::new(decompressed_block);
         self.cache
             .lock()
             .unwrap()
@@ -86,23 +89,139 @@ impl StoreReader {
     /// Reads a given document.
     ///
     /// Calling `.get(doc)` is relatively costly as it requires
-    /// decompressing a compressed block.
+    /// decompressing a compressed block. The store utilizes a LRU cache,
+    /// so accessing docs from the same compressed block should be faster.
+    /// For that reason a store reader should be kept and reused.
     ///
     /// It should not be called to score documents
     /// for instance.
     pub fn get(&self, doc_id: DocId) -> crate::Result<Document> {
+        let mut doc_bytes = self.get_document_bytes(doc_id)?;
+        Ok(Document::deserialize(&mut doc_bytes)?)
+    }
+
+    /// Reads raw bytes of a given document. Returns `RawDocument`, which contains the block of a document and its start and end
+    /// position within the block.
+    ///
+    /// Calling `.get(doc)` is relatively costly as it requires
+    /// decompressing a compressed block. The store utilizes a LRU cache,
+    /// so accessing docs from the same compressed block should be faster.
+    /// For that reason a store reader should be kept and reused.
+    ///
+    pub fn get_document_bytes(&self, doc_id: DocId) -> crate::Result<OwnedBytes> {
         let checkpoint = self.block_checkpoint(doc_id).ok_or_else(|| {
             crate::TantivyError::InvalidArgument(format!("Failed to lookup Doc #{}.", doc_id))
         })?;
-        let mut cursor = &self.read_block(&checkpoint)?[..];
+        let block = self.read_block(&checkpoint)?;
+        let mut cursor = &block[..];
+        let cursor_len_before = cursor.len();
         for _ in checkpoint.doc_range.start..doc_id {
             let doc_length = VInt::deserialize(&mut cursor)?.val() as usize;
             cursor = &cursor[doc_length..];
         }
 
         let doc_length = VInt::deserialize(&mut cursor)?.val() as usize;
-        cursor = &cursor[..doc_length];
-        Ok(Document::deserialize(&mut cursor)?)
+        let start_pos = cursor_len_before - cursor.len();
+        let end_pos = cursor_len_before - cursor.len() + doc_length;
+        Ok(block.slice(start_pos..end_pos))
+    }
+
+    /// Iterator over all Documents in their order as they are stored in the doc store.
+    /// Use this, if you want to extract all Documents from the doc store.
+    /// The delete_bitset has to be forwarded from the `SegmentReader` or the results maybe wrong.
+    pub fn iter<'a: 'b, 'b>(
+        &'b self,
+        delete_bitset: Option<&'a DeleteBitSet>,
+    ) -> impl Iterator<Item = crate::Result<Document>> + 'b {
+        self.iter_raw(delete_bitset).map(|doc_bytes_res| {
+            let mut doc_bytes = doc_bytes_res?;
+            Ok(Document::deserialize(&mut doc_bytes)?)
+        })
+    }
+
+    /// Iterator over all RawDocuments in their order as they are stored in the doc store.
+    /// Use this, if you want to extract all Documents from the doc store.
+    /// The delete_bitset has to be forwarded from the `SegmentReader` or the results maybe wrong.
+    pub(crate) fn iter_raw<'a: 'b, 'b>(
+        &'b self,
+        delete_bitset: Option<&'a DeleteBitSet>,
+    ) -> impl Iterator<Item = crate::Result<OwnedBytes>> + 'b {
+        let last_docid = self
+            .block_checkpoints()
+            .last()
+            .map(|checkpoint| checkpoint.doc_range.end)
+            .unwrap_or(0);
+        let mut checkpoint_block_iter = self.block_checkpoints();
+        let mut curr_checkpoint = checkpoint_block_iter.next();
+        let mut curr_block = curr_checkpoint
+            .as_ref()
+            .map(|checkpoint| self.read_block(&checkpoint).map_err(|e| e.kind())); // map error in order to enable cloning
+        let mut block_start_pos = 0;
+        let mut num_skipped = 0;
+        (0..last_docid)
+            .filter_map(move |doc_id| {
+                // filter_map is only used to resolve lifetime issues between the two closures on
+                // the outer variables
+                let alive = delete_bitset.map_or(true, |bitset| bitset.is_alive(doc_id));
+                if !alive {
+                    // we keep the number of skipped documents to move forward in the map block
+                    num_skipped += 1;
+                }
+                // check move to next checkpoint
+                let mut reset_block_pos = false;
+                if doc_id >= curr_checkpoint.as_ref().unwrap().doc_range.end {
+                    curr_checkpoint = checkpoint_block_iter.next();
+                    curr_block = curr_checkpoint
+                        .as_ref()
+                        .map(|checkpoint| self.read_block(&checkpoint).map_err(|e| e.kind()));
+                    reset_block_pos = true;
+                    num_skipped = 0;
+                }
+
+                if alive {
+                    let ret = Some((curr_block.clone(), num_skipped, reset_block_pos));
+                    // the map block will move over the num_skipped, so we reset to 0
+                    num_skipped = 0;
+                    ret
+                } else {
+                    None
+                }
+            })
+            .map(move |(block, num_skipped, reset_block_pos)| {
+                let block = block
+                    .ok_or_else(|| {
+                        DataCorruption::comment_only(
+                            "the current checkpoint in the doc store iterator is none, this should never happen",
+                        )
+                    })?
+                    .map_err(|error_kind| {
+                        std::io::Error::new(error_kind, "error when reading block in doc store")
+                    })?;
+                // this flag is set, when filter_map moved to the next block
+                if reset_block_pos {
+                    block_start_pos = 0;
+                }
+                let mut cursor = &block[block_start_pos..];
+                let mut pos = 0;
+                // move forward 1 doc + num_skipped in block and return length of current doc
+                let doc_length = loop {
+                    let doc_length = VInt::deserialize(&mut cursor)?.val() as usize;
+                    let num_bytes_read = block[block_start_pos..].len() - cursor.len();
+                    block_start_pos += num_bytes_read;
+
+                    pos += 1;
+                    if pos == num_skipped + 1 {
+                        break doc_length;
+                    } else {
+                        block_start_pos += doc_length;
+                        cursor = &block[block_start_pos..];
+                    }
+                };
+                let end_pos = block_start_pos + doc_length;
+                let doc_bytes = block.slice(block_start_pos..end_pos);
+                block_start_pos = end_pos;
+                Ok(doc_bytes)
+            })
     }
 
     /// Summarize total space usage of this store reader.
@@ -191,7 +310,7 @@ mod tests {
                 .unwrap()
                 .peek_lru()
                 .map(|(&k, _)| k as usize),
-            Some(9249)
+            Some(9210)
         );
 
         Ok(())
